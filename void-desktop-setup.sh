@@ -46,21 +46,57 @@ declare -a FAILED_STEPS=()
 # Both stream full xbps-install output to the terminal AND the log file, so
 # nothing important is ever hidden.
 # ----------------------------------------------------------------------------
+# IMPORTANT: xbps-install treats a multi-package argument list as ONE
+# transaction -- if even one name in the list is wrong/unavailable, the
+# WHOLE transaction is rejected and nothing gets installed, including the
+# packages that were perfectly fine. So both wrappers below install each
+# package as its own separate transaction: one bad/renamed package name
+# only affects itself, not its neighbors.
 xi() {
-    info "Installing (required): $*"
-    if ! xbps-install -y "$@" 2>&1 | tee -a "$LOG_FILE"; then
-        die "Failed to install required package(s): $*"
+    # required packages: install one at a time; abort with a precise
+    # error naming exactly which package failed.
+    local pkg failed=()
+    for pkg in "$@"; do
+        info "Installing (required): $pkg"
+        if ! xbps-install -y "$pkg" 2>&1 | tee -a "$LOG_FILE"; then
+            err "Failed to install required package: $pkg"
+            failed+=("$pkg")
+        fi
+    done
+    if [ "${#failed[@]}" -gt 0 ]; then
+        die "Required package(s) failed to install: ${failed[*]}"
     fi
 }
 
 xi_soft() {
-    info "Installing (optional): $*"
-    if ! xbps-install -y "$@" 2>&1 | tee -a "$LOG_FILE"; then
-        warn "Optional package(s) failed to install, continuing: $*"
-        FAILED_STEPS+=("optional packages: $*")
-        return 1
-    fi
-    return 0
+    # optional/best-effort packages: install one at a time; never abort.
+    local pkg ok_any=1
+    for pkg in "$@"; do
+        info "Installing (optional): $pkg"
+        if xbps-install -y "$pkg" 2>&1 | tee -a "$LOG_FILE"; then
+            ok_any=0
+        else
+            warn "Optional package failed to install, continuing: $pkg"
+            FAILED_STEPS+=("optional package: $pkg")
+        fi
+    done
+    return $ok_any
+}
+
+# Try a list of candidate package names one after another; install (and
+# stop) on the first one that succeeds. Useful when a package's exact name
+# is inconsistent across distros/versions (e.g. tuigreet vs greetd-tuigreet).
+xi_first_available() {
+    local pkg
+    for pkg in "$@"; do
+        info "Trying package: $pkg"
+        if xbps-install -y "$pkg" 2>&1 | tee -a "$LOG_FILE"; then
+            echo "$pkg"
+            return 0
+        fi
+        warn "'$pkg' not available, trying next candidate..."
+    done
+    return 1
 }
 
 sync_repos() {
@@ -311,10 +347,11 @@ ok "Audio stack installed (PipeWire + ALSA compatibility layer)."
 # STEP 7: Printing -- CUPS + Avahi for network/driverless printers
 # ============================================================================
 header "Setting up printing (CUPS)"
-xi cups cups-filters avahi nss-mdns system-config-printer
+xi cups cups-filters avahi nss-mdns
+xi_soft system-config-printer
 
 enable_service cupsd hard
-enable_service avahid
+enable_service avahi-daemon
 verify_binary lpstat "CUPS"
 
 if getent group lpadmin >/dev/null 2>&1; then
@@ -326,7 +363,10 @@ ok "CUPS installed and enabled. Manage printers at http://localhost:631 or via s
 # STEP 8: GPU drivers
 # ============================================================================
 header "Installing GPU drivers"
-xi vulkan-loader mesa-dri mesa-vaapi mesa-vdpau
+# Note: Void does not ship a standalone "mesa-vdpau" package -- VDPAU support
+# is provided everywhere via the libvdpau-va-gl wrapper (per Void's own
+# AMD/Intel/NVIDIA driver docs), so that's installed per-branch below instead.
+xi vulkan-loader mesa-dri mesa-vaapi libvdpau-va-gl
 
 case "$GPU_CHOICE" in
     1) info "Installing AMD drivers..."
@@ -340,7 +380,7 @@ case "$GPU_CHOICE" in
        warn "Intel Arc dGPUs need a recent kernel. Run 'xbps-install -Su linux' if you hit issues."
        ;;
     4) info "Installing NVIDIA (Nouveau, open-source) drivers..."
-       xi xf86-video-nouveau mesa-vulkan-nouveau libvdpau-va-gl
+       xi xf86-video-nouveau mesa-vulkan-nouveau
        ;;
     5) info "Installing NVIDIA proprietary drivers..."
        xi nvidia nvidia-libs
@@ -375,7 +415,10 @@ install_dms_repo() {
 install_dank_material_shell() {
     info "Installing Dank Material Shell (DMS)..."
     install_dms_repo
-    xi dms dgop matugen
+    # matugen/quickshell are pulled in automatically as dependencies of dms,
+    # so only dms + dgop are installed explicitly here.
+    xi dms
+    xi_soft dgop
     verify_binary dms "Dank Material Shell"
     ok "Dank Material Shell installed."
 }
@@ -400,15 +443,26 @@ install_hyprland_repo() {
 }
 
 install_greetd() {
-    local session_cmd="$1"
-    xi greetd greetd-tuigreet
+    local session_cmd="$1" greeter_cmd
+    xi greetd
+    # The tuigreet package name has varied between Void package revisions
+    # (tuigreet vs greetd-tuigreet). Try both; if neither is available,
+    # fall back to agreety, which ships as part of the greetd package
+    # itself and always works, just with a plainer prompt.
+    if xi_first_available tuigreet greetd-tuigreet >/dev/null; then
+        greeter_cmd="tuigreet --time --remember --cmd '${session_cmd}'"
+        ok "Using tuigreet as the greetd front-end."
+    else
+        warn "No tuigreet package found -- falling back to greetd's built-in agreety greeter."
+        greeter_cmd="agreety --cmd '${session_cmd}'"
+    fi
     mkdir -p /etc/greetd
     cat > /etc/greetd/config.toml <<EOFGREET
 [terminal]
 vt = 1
 
 [default_session]
-command = "tuigreet --time --remember --cmd '${session_cmd}'"
+command = "${greeter_cmd}"
 user = "greeter"
 EOFGREET
     enable_service greetd hard
@@ -428,68 +482,80 @@ autostart_shell_cmd() {
 
 # Full "xorg" meta-package (not xorg-minimal) so DDX drivers/fonts/input
 # drivers are all guaranteed present -- this is a common cause of a blank
-# screen or missing DM on Xorg desktops.
-XORG_PKGS=(xorg xterm setxkbmap numlockx)
+# screen or missing DM on Xorg desktops. Only "xorg" itself is treated as
+# hard-required; xterm/setxkbmap/numlockx are just conveniences.
+XORG_PKGS=(xorg)
+XORG_EXTRAS=(xterm setxkbmap numlockx)
 WAYLAND_CORE=(wayland xorg-server-xwayland)
 
 case "$DE_CHOICE" in
-    1) xi "${XORG_PKGS[@]}"
-       xi kde-plasma kde-baseapps
+    1) xi "${XORG_PKGS[@]}"; xi_soft "${XORG_EXTRAS[@]}"
+       xi kde-plasma
+       xi_soft kde-baseapps
        enable_service sddm hard
        verify_binary sddm "SDDM"
        ok "KDE Plasma installed. Login manager: SDDM."
        ;;
-    2) xi "${XORG_PKGS[@]}"
-       xi gnome gdm gnome-browser-connector xdg-desktop-portal-gnome
+    2) xi "${XORG_PKGS[@]}"; xi_soft "${XORG_EXTRAS[@]}"
+       xi gnome gdm
+       xi_soft gnome-browser-connector xdg-desktop-portal-gnome
        enable_service gdm hard
        verify_binary gdm "GDM"
        ok "GNOME installed. Login manager: GDM."
        ;;
-    3) xi "${XORG_PKGS[@]}"
-       xi xfce4 xfce4-goodies lightdm lightdm-gtk3-greeter network-manager-applet
+    3) xi "${XORG_PKGS[@]}"; xi_soft "${XORG_EXTRAS[@]}"
+       xi xfce4 lightdm lightdm-gtk3-greeter
+       xi_soft xfce4-goodies network-manager-applet
        enable_service lightdm hard
        verify_binary lightdm "LightDM"
        ok "XFCE installed. Login manager: LightDM."
        ;;
-    4) xi "${XORG_PKGS[@]}"
-       xi mate mate-extra lightdm lightdm-gtk3-greeter network-manager-applet
+    4) xi "${XORG_PKGS[@]}"; xi_soft "${XORG_EXTRAS[@]}"
+       xi mate lightdm lightdm-gtk3-greeter
+       xi_soft mate-extra network-manager-applet
        enable_service lightdm hard
        verify_binary lightdm "LightDM"
        ok "MATE installed. Login manager: LightDM."
        ;;
-    5) xi "${XORG_PKGS[@]}"
-       xi lxqt sddm network-manager-applet
+    5) xi "${XORG_PKGS[@]}"; xi_soft "${XORG_EXTRAS[@]}"
+       xi lxqt sddm
+       xi_soft network-manager-applet
        enable_service sddm hard
        verify_binary sddm "SDDM"
        ok "LXQt installed. Login manager: SDDM."
        ;;
     6) install_hyprland_repo
-       xi hyprland hyprland-devel xdg-desktop-portal-hyprland \
-          hypridle hyprlock hyprpaper qt5-wayland qt6-wayland "${WAYLAND_CORE[@]}" pcmanfm gvfs-mtp
+       xi hyprland "${WAYLAND_CORE[@]}"
+       xi_soft hyprland-devel xdg-desktop-portal-hyprland \
+          hypridle hyprlock hyprpaper qt5-wayland qt6-wayland pcmanfm gvfs-mtp
        install_dank_material_shell
        install_greetd "Hyprland"
        autostart_shell_cmd ".config/hypr" "hyprland.conf" "exec-once = dms run"
-       ok "Hyprland + Dank Material Shell installed. Login manager: greetd/tuigreet."
+       ok "Hyprland + Dank Material Shell installed. Login manager: greetd."
        ;;
-    7) xi niri xdg-desktop-portal-gtk "${WAYLAND_CORE[@]}" pcmanfm gvfs-mtp
+    7) xi niri "${WAYLAND_CORE[@]}"
+       xi_soft xdg-desktop-portal-gtk pcmanfm gvfs-mtp
        install_dank_material_shell
        install_greetd "niri"
        autostart_shell_cmd ".config/niri" "config.kdl" "spawn-at-startup \"dms\" \"run\""
-       ok "Niri + Dank Material Shell installed. Login manager: greetd/tuigreet."
+       ok "Niri + Dank Material Shell installed. Login manager: greetd."
        ;;
-    8) xi sway swaylock swayidle swaybg xdg-desktop-portal-wlr "${WAYLAND_CORE[@]}" pcmanfm gvfs-mtp
+    8) xi sway "${WAYLAND_CORE[@]}"
+       xi_soft swaylock swayidle swaybg xdg-desktop-portal-wlr pcmanfm gvfs-mtp
        install_dank_material_shell
        install_greetd "sway"
        autostart_shell_cmd ".config/sway" "config" "exec dms run"
-       ok "Sway + Dank Material Shell installed. Login manager: greetd/tuigreet."
+       ok "Sway + Dank Material Shell installed. Login manager: greetd."
        ;;
-    9) xi labwc swaybg xdg-desktop-portal-wlr "${WAYLAND_CORE[@]}" pcmanfm gvfs-mtp
+    9) xi labwc "${WAYLAND_CORE[@]}"
+       xi_soft swaybg xdg-desktop-portal-wlr pcmanfm gvfs-mtp
        install_dank_material_shell
        install_greetd "labwc"
        autostart_shell_cmd ".config/labwc" "autostart" "dms run &"
-       ok "Labwc + Dank Material Shell installed. Login manager: greetd/tuigreet."
+       ok "Labwc + Dank Material Shell installed. Login manager: greetd."
        ;;
-    10) xi wayfire wf-shell wcm xdg-desktop-portal-wlr "${WAYLAND_CORE[@]}" pcmanfm gvfs-mtp
+    10) xi wayfire "${WAYLAND_CORE[@]}"
+        xi_soft wf-shell wcm xdg-desktop-portal-wlr pcmanfm gvfs-mtp
         install_noctalia_shell
         install_greetd "wayfire"
         WF_CONF="$TARGET_HOME/.config/wayfire.ini"
@@ -500,9 +566,10 @@ case "$DE_CHOICE" in
             printf '\n[autostart]\nnoctalia = noctalia-shell\n' >> "$WF_CONF"
         fi
         chown "$TARGET_USER":"$TARGET_USER" "$WF_CONF" 2>/dev/null || true
-        ok "Wayfire + Noctalia Shell installed. Login manager: greetd/tuigreet."
+        ok "Wayfire + Noctalia Shell installed. Login manager: greetd."
         ;;
-    11) xi river xdg-desktop-portal-wlr "${WAYLAND_CORE[@]}" pcmanfm gvfs-mtp
+    11) xi river "${WAYLAND_CORE[@]}"
+        xi_soft xdg-desktop-portal-wlr pcmanfm gvfs-mtp
         install_noctalia_shell
         install_greetd "river"
         RIVER_INIT="$TARGET_HOME/.config/river/init"
@@ -514,11 +581,11 @@ case "$DE_CHOICE" in
         fi
         chown "$TARGET_USER":"$TARGET_USER" "$RIVER_INIT" 2>/dev/null || true
         chmod +x "$RIVER_INIT" 2>/dev/null || true
-        ok "River + Noctalia Shell installed. Login manager: greetd/tuigreet."
+        ok "River + Noctalia Shell installed. Login manager: greetd."
         ;;
-    12) xi "${XORG_PKGS[@]}"
-        xi i3 i3status i3lock dmenu picom feh lightdm lightdm-gtk3-greeter \
-           pcmanfm gvfs network-manager-applet
+    12) xi "${XORG_PKGS[@]}"; xi_soft "${XORG_EXTRAS[@]}"
+        xi i3 lightdm lightdm-gtk3-greeter
+        xi_soft i3status i3lock dmenu picom feh pcmanfm gvfs network-manager-applet
         enable_service lightdm hard
         verify_binary lightdm "LightDM"
         ok "i3 installed. Login manager: LightDM. (DMS/Noctalia are Wayland-only; i3 uses i3status/dmenu.)"
