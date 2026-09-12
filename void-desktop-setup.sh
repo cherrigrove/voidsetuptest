@@ -3,26 +3,20 @@
 # void-desktop-setup.sh
 #
 # Automated post-install desktop setup for Void Linux.
-#   - Desktop Environment / Window Manager installation (from official Void
-#     repos, plus optional well-known third-party repos for Hyprland/DMS/Noctalia)
-#   - GPU driver installation (AMD, Intel iGPU, Intel dGPU, NVIDIA Nouveau,
-#     NVIDIA Proprietary, Mesa/virtual-machine)
-#   - Audio (PipeWire + WirePlumber + ALSA compatibility)
-#   - Networking (NetworkManager, wifi firmware)
-#   - Sudo, user groups, file manager / archive / mounting support
-#   - DankMaterialShell (DMS) bundled by default on compositors it supports,
-#     falling back to Noctalia Shell on compositors DMS does not support.
+#   - Desktop Environment / Window Manager  (official Void repos, plus
+#     well-known third-party repos for Hyprland / DankMaterialShell / Noctalia)
+#   - Login manager: SDDM (Plasma/LXQt), GDM (GNOME), LightDM (XFCE/MATE/i3),
+#     greetd+tuigreet (bare Wayland compositors)
+#   - GPU drivers: AMD, Intel iGPU, Intel dGPU, NVIDIA Nouveau, NVIDIA
+#     Proprietary, Mesa (VMs)
+#   - Audio: PipeWire + WirePlumber + ALSA compatibility layer
+#   - Networking: NetworkManager + wifi firmware
+#   - Printing: CUPS + Avahi (network/driverless printer discovery)
+#   - Xorg / Wayland core packages, sudo, user groups, file manager access
+#   - Every critical package/service install is verified; the script stops
+#     with a clear error instead of silently limping on.
 #
-# Tested against Void Linux (glibc + musl), x86_64. Run as a normal user
-# with sudo installed and in the wheel group, OR just run it -- it will
-# re-exec itself with sudo automatically.
-#
-# Sources consulted (Void Handbook, DankMaterialShell & Noctalia docs):
-#   https://docs.voidlinux.org/config/graphical-session/
-#   https://docs.voidlinux.org/config/media/pipewire.html
-#   https://docs.voidlinux.org/config/network/networkmanager.html
-#   https://danklinux.com/docs/1.6/dankmaterialshell/installation
-#   https://docs.noctalia.dev/noctalia/getting-started/installation/
+# Usage:  sudo bash void-desktop-setup.sh          (or just: bash void-desktop-setup.sh)
 #
 set -uo pipefail
 
@@ -37,48 +31,90 @@ ok()    { printf "${C_GREEN}${C_BOLD}[OK]${C_RESET} %s\n" "$*"; }
 warn()  { printf "${C_YELLOW}${C_BOLD}[!]${C_RESET} %s\n" "$*"; }
 err()   { printf "${C_RED}${C_BOLD}[ERROR]${C_RESET} %s\n" "$*" >&2; }
 header(){ printf "\n${C_CYAN}${C_BOLD}==== %s ====${C_RESET}\n" "$*"; }
-die()   { err "$*"; exit 1; }
+die()   { err "$*"; err "See $LOG_FILE for the full command output."; exit 1; }
 
 LOG_FILE="/var/log/void-desktop-setup.log"
 
-run() {
-    # Run a command, log it, and don't let a single failed package abort
-    # the whole script -- just warn loudly and keep going.
-    echo "+ $*" >> "$LOG_FILE" 2>/dev/null || true
-    if ! "$@"; then
-        warn "Command failed (continuing): $*"
+# Every failed/attempted command lands in this array so the final report can
+# tell the user exactly what to look at instead of a generic "it worked".
+declare -a FAILED_STEPS=()
+
+# ----------------------------------------------------------------------------
+# xbps-install wrappers
+#   xi        -> required package(s). Failure ABORTS the script immediately.
+#   xi_soft   -> optional/nice-to-have package(s). Failure just warns.
+# Both stream full xbps-install output to the terminal AND the log file, so
+# nothing important is ever hidden.
+# ----------------------------------------------------------------------------
+xi() {
+    info "Installing (required): $*"
+    if ! xbps-install -y "$@" 2>&1 | tee -a "$LOG_FILE"; then
+        die "Failed to install required package(s): $*"
+    fi
+}
+
+xi_soft() {
+    info "Installing (optional): $*"
+    if ! xbps-install -y "$@" 2>&1 | tee -a "$LOG_FILE"; then
+        warn "Optional package(s) failed to install, continuing: $*"
+        FAILED_STEPS+=("optional packages: $*")
         return 1
     fi
     return 0
 }
 
-xi() {
-    # xbps-install wrapper: -y auto-confirms (incl. new repo key trust)
-    run xbps-install -y "$@"
+sync_repos() {
+    info "Syncing repository index..."
+    xbps-install -Sy 2>&1 | tee -a "$LOG_FILE" || die "Could not sync xbps repositories. Check your network connection."
 }
 
+# ----------------------------------------------------------------------------
+# Service enabling, WITH verification
+# ----------------------------------------------------------------------------
 enable_service() {
-    local svc="$1"
-    if [ -d "/etc/sv/$svc" ]; then
-        if [ ! -e "/var/service/$svc" ]; then
-            ln -s "/etc/sv/$svc" /var/service/ 2>/dev/null \
-                && ok "Enabled service: $svc" \
-                || warn "Could not enable service: $svc"
-        else
-            ok "Service already enabled: $svc"
+    local svc="$1" required="${2:-soft}"
+    if [ ! -d "/etc/sv/$svc" ]; then
+        if [ "$required" = "hard" ]; then
+            FAILED_STEPS+=("service '$svc' not found in /etc/sv -- its package did not install correctly")
+            warn "/etc/sv/$svc does not exist -- the package providing it did not install correctly."
         fi
+        return 1
+    fi
+    if [ ! -e "/var/service/$svc" ]; then
+        ln -s "/etc/sv/$svc" /var/service/ 2>/dev/null
+    fi
+    # Give runit a moment to pick it up, then verify.
+    sleep 1
+    if [ -L "/var/service/$svc" ]; then
+        ok "Service enabled: $svc"
+        return 0
+    else
+        FAILED_STEPS+=("service '$svc' could not be enabled")
+        warn "Could not enable service: $svc"
+        return 1
+    fi
+}
+
+verify_binary() {
+    local bin="$1" label="$2"
+    if command -v "$bin" >/dev/null 2>&1; then
+        ok "$label found ($bin)"
+        return 0
+    else
+        FAILED_STEPS+=("$label: '$bin' not found on PATH after install")
+        warn "$label: '$bin' not found after installation!"
+        return 1
     fi
 }
 
 # ----------------------------------------------------------------------------
-# Re-exec with sudo/root if needed
+# Re-exec with root if needed (sudo will set SUDO_USER for us automatically)
 # ----------------------------------------------------------------------------
 if [ "$(id -u)" -ne 0 ]; then
     info "Root privileges are required. Re-running with sudo..."
-    exec sudo -E bash "$0" "${ORIGINAL_USER:-$USER}" "$@"
+    exec sudo -E bash "$0" "$@"
 fi
 
-# Figure out which non-root account we're setting the desktop up for.
 if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
     TARGET_USER="$SUDO_USER"
 elif [ $# -ge 1 ] && id "$1" &>/dev/null; then
@@ -88,43 +124,34 @@ else
     read -rp "Enter the username this desktop setup is for: " TARGET_USER
 fi
 
-id "$TARGET_USER" &>/dev/null || die "User '$TARGET_USER' does not exist. Create it first with 'useradd -m -G wheel $TARGET_USER'."
+id "$TARGET_USER" &>/dev/null || die "User '$TARGET_USER' does not exist. Create it first with: useradd -m -G wheel $TARGET_USER"
 TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 
 # ----------------------------------------------------------------------------
 # Sanity checks
 # ----------------------------------------------------------------------------
+: > "$LOG_FILE" 2>/dev/null || LOG_FILE=/dev/null
+
 if [ -r /etc/os-release ]; then
     . /etc/os-release
-    if [ "${ID:-}" != "void" ]; then
-        warn "This does not look like Void Linux (ID='${ID:-unknown}'). Continuing anyway."
-    fi
-else
-    warn "Could not read /etc/os-release. Continuing anyway."
+    [ "${ID:-}" = "void" ] || warn "This does not look like Void Linux (ID='${ID:-unknown}'). Continuing anyway."
 fi
 
 command -v xbps-install >/dev/null 2>&1 || die "xbps-install not found -- this script only works on Void Linux."
 
 ARCH=$(xbps-uhelper arch)
-LIBC="glibc"
-case "$ARCH" in
-    *musl*) LIBC="musl" ;;
-esac
-info "Detected architecture: $ARCH ($LIBC)"
-
-: > "$LOG_FILE" 2>/dev/null || LOG_FILE=/dev/null
+info "Detected architecture: $ARCH"
+info "Setting up desktop for user: $TARGET_USER (home: $TARGET_HOME)"
 
 # ----------------------------------------------------------------------------
 # Menu helper
 # ----------------------------------------------------------------------------
 ask_choice() {
-    # ask_choice "Prompt title" min max
-    local prompt="$1" min="$2" max="$3" choice
+    local min="$1" max="$2" choice
     while true; do
         read -rp "Enter your choice [$min-$max]: " choice
         if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge "$min" ] && [ "$choice" -le "$max" ]; then
-            echo "$choice"
-            return 0
+            echo "$choice"; return 0
         fi
         warn "Invalid choice. Please enter a number between $min and $max."
     done
@@ -133,29 +160,55 @@ ask_choice() {
 # ============================================================================
 # STEP 1: Desktop Environment / Window Manager selection
 # ============================================================================
+DE_NAMES=(
+    ""                                  # 0 unused
+    "KDE Plasma"
+    "GNOME"
+    "XFCE"
+    "MATE"
+    "LXQt"
+    "Hyprland + Dank Material Shell"
+    "Niri + Dank Material Shell"
+    "Sway + Dank Material Shell"
+    "Labwc + Dank Material Shell"
+    "Wayfire + Noctalia Shell"
+    "River + Noctalia Shell"
+    "i3"
+)
+
 header "Void Linux Desktop Setup"
 cat <<'EOF'
 Choose a Desktop Environment/Window Manager:
 
-  1. KDE Plasma          (full DE, Xorg + Wayland, official repos)
-  2. GNOME                (full DE, Wayland by default, official repos)
-  3. XFCE                 (lightweight DE, Xorg, official repos)
-  4. MATE                 (lightweight DE, Xorg, official repos)
-  5. LXQt                 (lightweight DE, Xorg, official repos)
-  6. Hyprland             (Wayland WM, tiling)  -> bundled with Dank Material Shell
-  7. Niri                 (Wayland WM, scrolling)-> bundled with Dank Material Shell
-  8. Sway                 (Wayland WM, i3-like) -> bundled with Dank Material Shell
-  9. Labwc                (Wayland WM, Openbox-style) -> bundled with Dank Material Shell
+  1. KDE Plasma           (full DE, Xorg + Wayland, official repos)
+  2. GNOME                 (full DE, Wayland by default, official repos)
+  3. XFCE                  (lightweight DE, Xorg, official repos)
+  4. MATE                  (lightweight DE, Xorg, official repos)
+  5. LXQt                  (lightweight DE, Xorg, official repos)
+  6. Hyprland              (Wayland WM, tiling)   -> bundled with Dank Material Shell
+  7. Niri                  (Wayland WM, scrolling) -> bundled with Dank Material Shell
+  8. Sway                  (Wayland WM, i3-like)   -> bundled with Dank Material Shell
+  9. Labwc                 (Wayland WM, Openbox-style) -> bundled with Dank Material Shell
  10. Wayfire               (Wayland WM, 3D/compiz-like) -> bundled with Noctalia Shell
  11. River                 (Wayland WM, dynamic tiling) -> bundled with Noctalia Shell
  12. i3                    (Xorg WM, tiling, minimal)
 
 EOF
-DE_CHOICE=$(ask_choice "de" 1 12)
+DE_CHOICE=$(ask_choice 1 12)
 
 # ============================================================================
 # STEP 2: GPU driver selection
 # ============================================================================
+GPU_NAMES=(
+    ""
+    "AMD"
+    "Intel iGPU"
+    "Intel dGPU"
+    "NVIDIA Nouveau (open-source)"
+    "NVIDIA Proprietary"
+    "Mesa (for VMs)"
+)
+
 header "GPU Driver Setup"
 cat <<'EOF'
 Choose your GPU Drivers:
@@ -163,68 +216,73 @@ Choose your GPU Drivers:
   1. AMD
   2. Intel iGPU
   3. Intel dGPU
-  4. NVIDIA Nouveau (open-source)
+  4. NVIDIA Nouveau
   5. NVIDIA Proprietary
   6. Mesa (for VMs)
 
 EOF
-GPU_CHOICE=$(ask_choice "gpu" 1 6)
+GPU_CHOICE=$(ask_choice 1 6)
 
 header "Summary"
 echo "  User:              $TARGET_USER"
-echo "  Desktop/WM:        option $DE_CHOICE"
-echo "  GPU driver:        option $GPU_CHOICE"
+echo "  Desktop/WM:        ${DE_NAMES[$DE_CHOICE]}"
+echo "  GPU driver:        ${GPU_NAMES[$GPU_CHOICE]}"
 read -rp "Proceed with installation? [Y/n] " CONFIRM
 CONFIRM=${CONFIRM:-Y}
 [[ "$CONFIRM" =~ ^[Yy] ]] || die "Aborted by user."
 
 # ============================================================================
-# STEP 3: Sync repos + enable nonfree (needed for firmware / NVIDIA)
+# STEP 3: Full system sync/update FIRST.
+# A fresh/ISO Void install often has a stale package index; installing
+# desktop metapackages against it is the #1 cause of "it didn't work".
 # ============================================================================
-header "Enabling repositories"
+header "Updating package index and system"
+sync_repos
+info "Running a full system update (this can take a while on a fresh VM)..."
+xbps-install -Suy 2>&1 | tee -a "$LOG_FILE"
+# Void convention: if xbps itself was updated, a 2nd pass picks up the rest.
+xbps-install -Suy 2>&1 | tee -a "$LOG_FILE"
+ok "System is up to date."
+
 xi void-repo-nonfree
-run xbps-install -Sy
-ok "Repository index synced"
+sync_repos
 
 # ============================================================================
 # STEP 4: Base graphical stack (dbus, seat management, portals, fonts)
 # ============================================================================
 header "Installing base system services"
-BASE_PKGS=(
-    dbus elogind seatd polkit
-    xdg-user-dirs xdg-user-dirs-gtk xdg-utils xdg-desktop-portal
-    sudo git wget curl nano unzip zip htop
-    dejavu-fonts-ttf liberation-fonts-ttf noto-fonts-emoji terminus-font
-    udisks2 gvfs
-)
-xi "${BASE_PKGS[@]}"
+xi dbus elogind seatd polkit \
+   xdg-user-dirs xdg-user-dirs-gtk xdg-utils xdg-desktop-portal \
+   sudo git wget curl nano unzip zip htop \
+   dejavu-fonts-ttf liberation-fonts-ttf noto-fonts-emoji terminus-font \
+   udisks2 gvfs
 
-enable_service dbus
+enable_service dbus hard
 enable_service polkitd
 enable_service elogind
 enable_service seatd
 
-# make sure the target user can use libseat
 if getent group _seatd >/dev/null 2>&1; then
     usermod -aG _seatd "$TARGET_USER"
 fi
 
 # ============================================================================
-# STEP 5: Networking (NetworkManager + wifi firmware)
+# STEP 5: Networking -- NetworkManager for WiFi + Ethernet
 # ============================================================================
-header "Setting up networking / WiFi"
+header "Setting up networking / WiFi (NetworkManager)"
 xi NetworkManager network-manager-applet linux-firmware-network wpa_supplicant
-enable_service NetworkManager
 
-# disable dhcpcd if it's running, NetworkManager will take over
-if [ -e /var/service/dhcpcd ]; then
-    rm -f /var/service/dhcpcd
-fi
+# Void ships dhcpcd enabled by default on some install profiles; it will
+# fight with NetworkManager over the interface, so disable it if present.
+[ -e /var/service/dhcpcd ] && rm -f /var/service/dhcpcd
 
+enable_service NetworkManager hard
+verify_binary nmcli "NetworkManager CLI"
 usermod -aG network "$TARGET_USER" 2>/dev/null || true
+ok "NetworkManager installed and enabled."
 
 # ============================================================================
-# STEP 6: Audio (PipeWire + WirePlumber + ALSA + Bluetooth audio)
+# STEP 6: Audio -- PipeWire + WirePlumber + ALSA compatibility
 # ============================================================================
 header "Setting up audio (PipeWire)"
 xi pipewire alsa-pipewire libspa-bluetooth pavucontrol pamixer playerctl
@@ -237,104 +295,110 @@ mkdir -p /etc/alsa/conf.d
 ln -sf /usr/share/alsa/alsa.conf.d/50-pipewire.conf /etc/alsa/conf.d/50-pipewire.conf 2>/dev/null || true
 ln -sf /usr/share/alsa/alsa.conf.d/99-pipewire-default.conf /etc/alsa/conf.d/99-pipewire-default.conf 2>/dev/null || true
 
-# Autostart pipewire graphically for environments that honor XDG autostart
 mkdir -p /etc/xdg/autostart
 [ -f /usr/share/applications/pipewire.desktop ] && \
-    ln -sf /usr/share/applications/pipewire.desktop /etc/xdg/autostart/pipewire.desktop 2>/dev/null || true
+    ln -sf /usr/share/applications/pipewire.desktop /etc/xdg/autostart/pipewire.desktop 2>/dev/null
 
+[ -f /usr/share/applications/pipewire-pulse.desktop ] && \
+    ln -sf /usr/share/applications/pipewire-pulse.desktop /etc/xdg/autostart/pipewire-pulse.desktop 2>/dev/null
+
+verify_binary pipewire "PipeWire"
+verify_binary wireplumber "WirePlumber"
 usermod -aG audio,video,input "$TARGET_USER" 2>/dev/null || true
-ok "Audio stack installed (PipeWire + ALSA compatibility layer)"
+ok "Audio stack installed (PipeWire + ALSA compatibility layer)."
 
 # ============================================================================
-# STEP 7: GPU drivers
+# STEP 7: Printing -- CUPS + Avahi for network/driverless printers
+# ============================================================================
+header "Setting up printing (CUPS)"
+xi cups cups-filters avahi nss-mdns system-config-printer
+
+enable_service cupsd hard
+enable_service avahid
+verify_binary lpstat "CUPS"
+
+if getent group lpadmin >/dev/null 2>&1; then
+    usermod -aG lpadmin "$TARGET_USER"
+fi
+ok "CUPS installed and enabled. Manage printers at http://localhost:631 or via system-config-printer."
+
+# ============================================================================
+# STEP 8: GPU drivers
 # ============================================================================
 header "Installing GPU drivers"
-
-# Base Vulkan loader always useful
 xi vulkan-loader mesa-dri mesa-vaapi mesa-vdpau
 
 case "$GPU_CHOICE" in
-    1) # AMD
-        info "Installing AMD drivers..."
-        xi linux-firmware-amd mesa-vulkan-radeon xf86-video-amdgpu
-        ;;
-    2) # Intel iGPU
-        info "Installing Intel iGPU drivers..."
-        xi linux-firmware-intel mesa-vulkan-intel intel-video-accel
-        ;;
-    3) # Intel dGPU (Arc etc.)
-        info "Installing Intel dGPU (Arc) drivers..."
-        xi linux-firmware-intel mesa-vulkan-intel intel-video-accel
-        warn "Intel Arc dGPUs need a recent kernel. Run 'xbps-install -Su linux' if you hit issues."
-        ;;
-    4) # NVIDIA Nouveau
-        info "Installing NVIDIA (Nouveau, open-source) drivers..."
-        xi xf86-video-nouveau mesa-vulkan-nouveau libvdpau-va-gl
-        ;;
-    5) # NVIDIA Proprietary
-        info "Installing NVIDIA proprietary drivers..."
-        xi nvidia nvidia-libs
-        warn "A reboot is required for the proprietary NVIDIA driver to take effect."
-        ;;
-    6) # Mesa / VM
-        info "Installing Mesa (generic/VM) drivers..."
-        xi mesa-vulkan-swrast xf86-video-qxl xf86-video-vmware xf86-video-fbdev
-        xi qemu-guest-agent spice-vdagent
-        enable_service qemu-guest-agent
-        enable_service spice-vdagentd
-        # Detect and install proper guest tools when possible
-        SYS_VENDOR=""
-        [ -r /sys/class/dmi/id/sys_vendor ] && SYS_VENDOR=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)
-        case "$SYS_VENDOR" in
-            *VMware*) xi open-vm-tools; enable_service vmtoolsd ;;
-            *innotek*|*VirtualBox*) xi virtualbox-ose-guest; enable_service vboxguest ;;
-        esac
-        ;;
+    1) info "Installing AMD drivers..."
+       xi linux-firmware-amd mesa-vulkan-radeon xf86-video-amdgpu
+       ;;
+    2) info "Installing Intel iGPU drivers..."
+       xi linux-firmware-intel mesa-vulkan-intel intel-video-accel
+       ;;
+    3) info "Installing Intel dGPU (Arc) drivers..."
+       xi linux-firmware-intel mesa-vulkan-intel intel-video-accel
+       warn "Intel Arc dGPUs need a recent kernel. Run 'xbps-install -Su linux' if you hit issues."
+       ;;
+    4) info "Installing NVIDIA (Nouveau, open-source) drivers..."
+       xi xf86-video-nouveau mesa-vulkan-nouveau libvdpau-va-gl
+       ;;
+    5) info "Installing NVIDIA proprietary drivers..."
+       xi nvidia nvidia-libs
+       warn "A reboot is required for the proprietary NVIDIA driver to take effect."
+       ;;
+    6) info "Installing Mesa (generic/VM) drivers..."
+       xi mesa-vulkan-swrast xf86-video-qxl xf86-video-vmware xf86-video-fbdev
+       xi_soft qemu-guest-agent spice-vdagent
+       enable_service qemu-guest-agent
+       enable_service spice-vdagentd
+       SYS_VENDOR=""
+       [ -r /sys/class/dmi/id/sys_vendor ] && SYS_VENDOR=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)
+       case "$SYS_VENDOR" in
+           *VMware*) xi_soft open-vm-tools && enable_service vmtoolsd ;;
+           *innotek*|*VirtualBox*) xi_soft virtualbox-ose-guest && enable_service vboxguest ;;
+       esac
+       ;;
 esac
 ok "GPU driver installation complete."
 
 # ============================================================================
-# STEP 8: DE / WM installation
+# STEP 9: DE / WM installation
 # ============================================================================
-header "Installing Desktop Environment / Window Manager"
+header "Installing Desktop Environment / Window Manager: ${DE_NAMES[$DE_CHOICE]}"
 
 install_dms_repo() {
-    echo "repository=https://void.danklinux.com/dms/current" \
-        | tee /etc/xbps.d/10-dms.conf >/dev/null
-    echo "repository=https://void.danklinux.com/danklinux/current" \
-        | tee /etc/xbps.d/10-danklinux.conf >/dev/null
-    run xbps-install -Sy
+    echo "repository=https://void.danklinux.com/dms/current" > /etc/xbps.d/10-dms.conf
+    echo "repository=https://void.danklinux.com/danklinux/current" > /etc/xbps.d/10-danklinux.conf
+    sync_repos
 }
 
 install_dank_material_shell() {
     info "Installing Dank Material Shell (DMS)..."
     install_dms_repo
     xi dms dgop matugen
+    verify_binary dms "Dank Material Shell"
     ok "Dank Material Shell installed."
 }
 
 install_noctalia_repo() {
-    echo "repository=https://repo.voiders.dev" \
-        | tee /etc/xbps.d/10-voiders-community.conf >/dev/null
-    run xbps-install -Sy
+    echo "repository=https://repo.voiders.dev" > /etc/xbps.d/10-voiders-community.conf
+    sync_repos
 }
 
 install_noctalia_shell() {
     info "Installing Noctalia Shell..."
     install_noctalia_repo
-    # noctalia-qs (its quickshell fork) conflicts with a plain quickshell pkg
     xbps-remove -y quickshell 2>/dev/null || true
     xi noctalia-shell
+    verify_binary noctalia-shell "Noctalia Shell"
     ok "Noctalia Shell installed."
 }
 
 install_hyprland_repo() {
-    echo "repository=https://raw.githubusercontent.com/Makrennel/hyprland-void/repository-${ARCH}" \
-        | tee /etc/xbps.d/10-hyprland.conf >/dev/null
-    run xbps-install -Sy
+    echo "repository=https://raw.githubusercontent.com/Makrennel/hyprland-void/repository-${ARCH}" > /etc/xbps.d/10-hyprland.conf
+    sync_repos
 }
 
-# greetd is used as the universal login manager for bare Wayland compositors
 install_greetd() {
     local session_cmd="$1"
     xi greetd greetd-tuigreet
@@ -347,10 +411,9 @@ vt = 1
 command = "tuigreet --time --remember --cmd '${session_cmd}'"
 user = "greeter"
 EOFGREET
-    enable_service greetd
+    enable_service greetd hard
 }
 
-# Try to add an autostart line for DMS/Noctalia into a compositor's config
 autostart_shell_cmd() {
     local conf_dir="$1" conf_file="$2" line="$3"
     local full="$TARGET_HOME/$conf_dir/$conf_file"
@@ -363,70 +426,70 @@ autostart_shell_cmd() {
     chown "$TARGET_USER":"$TARGET_USER" "$full" 2>/dev/null || true
 }
 
-XORG_PKGS=(xorg-minimal xorg-fonts xorg-input-drivers xterm setxkbmap)
+# Full "xorg" meta-package (not xorg-minimal) so DDX drivers/fonts/input
+# drivers are all guaranteed present -- this is a common cause of a blank
+# screen or missing DM on Xorg desktops.
+XORG_PKGS=(xorg xterm setxkbmap numlockx)
+WAYLAND_CORE=(wayland xorg-server-xwayland)
 
 case "$DE_CHOICE" in
-    1) # KDE Plasma
-        xi "${XORG_PKGS[@]}"
-        xi kde-plasma kde-baseapps
-        enable_service dbus
-        ok "KDE Plasma installed. Login manager: SDDM."
-        ;;
-    2) # GNOME
-        xi "${XORG_PKGS[@]}"
-        xi gnome gdm gnome-browser-connector xdg-desktop-portal-gnome
-        ok "GNOME installed. Login manager: GDM."
-        ;;
-    3) # XFCE
-        xi "${XORG_PKGS[@]}"
-        xi xfce4 xfce4-goodies lightdm lightdm-gtk3-greeter network-manager-applet
-        enable_service lightdm
-        ok "XFCE installed. Login manager: LightDM."
-        ;;
-    4) # MATE
-        xi "${XORG_PKGS[@]}"
-        xi mate mate-extra lightdm lightdm-gtk3-greeter network-manager-applet
-        enable_service lightdm
-        ok "MATE installed. Login manager: LightDM."
-        ;;
-    5) # LXQt
-        xi "${XORG_PKGS[@]}"
-        xi lxqt sddm network-manager-applet
-        enable_service sddm
-        ok "LXQt installed. Login manager: SDDM."
-        ;;
-    6) # Hyprland + DMS
-        install_hyprland_repo
-        xi hyprland hyprland-devel xdg-desktop-portal-hyprland \
-           hypridle hyprlock hyprpaper qt5-wayland qt6-wayland xorg-server-xwayland pcmanfm gvfs-mtp
-        install_dank_material_shell
-        install_greetd "Hyprland"
-        autostart_shell_cmd ".config/hypr" "hyprland.conf" "exec-once = dms run"
-        ok "Hyprland + Dank Material Shell installed. Login manager: greetd/tuigreet."
-        ;;
-    7) # Niri + DMS
-        xi niri xdg-desktop-portal-gtk xorg-server-xwayland pcmanfm gvfs-mtp
-        install_dank_material_shell
-        install_greetd "niri"
-        autostart_shell_cmd ".config/niri" "config.kdl" "spawn-at-startup \"dms\" \"run\""
-        ok "Niri + Dank Material Shell installed. Login manager: greetd/tuigreet."
-        ;;
-    8) # Sway + DMS
-        xi sway swaylock swayidle swaybg xdg-desktop-portal-wlr xorg-server-xwayland pcmanfm gvfs-mtp
-        install_dank_material_shell
-        install_greetd "sway"
-        autostart_shell_cmd ".config/sway" "config" "exec dms run"
-        ok "Sway + Dank Material Shell installed. Login manager: greetd/tuigreet."
-        ;;
-    9) # Labwc + DMS
-        xi labwc swaybg xdg-desktop-portal-wlr xorg-server-xwayland pcmanfm gvfs-mtp
-        install_dank_material_shell
-        install_greetd "labwc"
-        autostart_shell_cmd ".config/labwc" "autostart" "dms run &"
-        ok "Labwc + Dank Material Shell installed. Login manager: greetd/tuigreet."
-        ;;
-    10) # Wayfire + Noctalia (DMS does not officially support Wayfire)
-        xi wayfire wf-shell wcm xdg-desktop-portal-wlr xorg-server-xwayland pcmanfm gvfs-mtp
+    1) xi "${XORG_PKGS[@]}"
+       xi kde-plasma kde-baseapps
+       enable_service sddm hard
+       verify_binary sddm "SDDM"
+       ok "KDE Plasma installed. Login manager: SDDM."
+       ;;
+    2) xi "${XORG_PKGS[@]}"
+       xi gnome gdm gnome-browser-connector xdg-desktop-portal-gnome
+       enable_service gdm hard
+       verify_binary gdm "GDM"
+       ok "GNOME installed. Login manager: GDM."
+       ;;
+    3) xi "${XORG_PKGS[@]}"
+       xi xfce4 xfce4-goodies lightdm lightdm-gtk3-greeter network-manager-applet
+       enable_service lightdm hard
+       verify_binary lightdm "LightDM"
+       ok "XFCE installed. Login manager: LightDM."
+       ;;
+    4) xi "${XORG_PKGS[@]}"
+       xi mate mate-extra lightdm lightdm-gtk3-greeter network-manager-applet
+       enable_service lightdm hard
+       verify_binary lightdm "LightDM"
+       ok "MATE installed. Login manager: LightDM."
+       ;;
+    5) xi "${XORG_PKGS[@]}"
+       xi lxqt sddm network-manager-applet
+       enable_service sddm hard
+       verify_binary sddm "SDDM"
+       ok "LXQt installed. Login manager: SDDM."
+       ;;
+    6) install_hyprland_repo
+       xi hyprland hyprland-devel xdg-desktop-portal-hyprland \
+          hypridle hyprlock hyprpaper qt5-wayland qt6-wayland "${WAYLAND_CORE[@]}" pcmanfm gvfs-mtp
+       install_dank_material_shell
+       install_greetd "Hyprland"
+       autostart_shell_cmd ".config/hypr" "hyprland.conf" "exec-once = dms run"
+       ok "Hyprland + Dank Material Shell installed. Login manager: greetd/tuigreet."
+       ;;
+    7) xi niri xdg-desktop-portal-gtk "${WAYLAND_CORE[@]}" pcmanfm gvfs-mtp
+       install_dank_material_shell
+       install_greetd "niri"
+       autostart_shell_cmd ".config/niri" "config.kdl" "spawn-at-startup \"dms\" \"run\""
+       ok "Niri + Dank Material Shell installed. Login manager: greetd/tuigreet."
+       ;;
+    8) xi sway swaylock swayidle swaybg xdg-desktop-portal-wlr "${WAYLAND_CORE[@]}" pcmanfm gvfs-mtp
+       install_dank_material_shell
+       install_greetd "sway"
+       autostart_shell_cmd ".config/sway" "config" "exec dms run"
+       ok "Sway + Dank Material Shell installed. Login manager: greetd/tuigreet."
+       ;;
+    9) xi labwc swaybg xdg-desktop-portal-wlr "${WAYLAND_CORE[@]}" pcmanfm gvfs-mtp
+       install_dank_material_shell
+       install_greetd "labwc"
+       autostart_shell_cmd ".config/labwc" "autostart" "dms run &"
+       ok "Labwc + Dank Material Shell installed. Login manager: greetd/tuigreet."
+       ;;
+    10) xi wayfire wf-shell wcm xdg-desktop-portal-wlr "${WAYLAND_CORE[@]}" pcmanfm gvfs-mtp
         install_noctalia_shell
         install_greetd "wayfire"
         WF_CONF="$TARGET_HOME/.config/wayfire.ini"
@@ -439,8 +502,7 @@ case "$DE_CHOICE" in
         chown "$TARGET_USER":"$TARGET_USER" "$WF_CONF" 2>/dev/null || true
         ok "Wayfire + Noctalia Shell installed. Login manager: greetd/tuigreet."
         ;;
-    11) # River + Noctalia (DMS does not officially support River)
-        xi river xdg-desktop-portal-wlr xorg-server-xwayland pcmanfm gvfs-mtp
+    11) xi river xdg-desktop-portal-wlr "${WAYLAND_CORE[@]}" pcmanfm gvfs-mtp
         install_noctalia_shell
         install_greetd "river"
         RIVER_INIT="$TARGET_HOME/.config/river/init"
@@ -454,17 +516,17 @@ case "$DE_CHOICE" in
         chmod +x "$RIVER_INIT" 2>/dev/null || true
         ok "River + Noctalia Shell installed. Login manager: greetd/tuigreet."
         ;;
-    12) # i3 (X11, no DMS/Noctalia -- both require Wayland)
-        xi "${XORG_PKGS[@]}"
+    12) xi "${XORG_PKGS[@]}"
         xi i3 i3status i3lock dmenu picom feh lightdm lightdm-gtk3-greeter \
            pcmanfm gvfs network-manager-applet
-        enable_service lightdm
+        enable_service lightdm hard
+        verify_binary lightdm "LightDM"
         ok "i3 installed. Login manager: LightDM. (DMS/Noctalia are Wayland-only; i3 uses i3status/dmenu.)"
         ;;
 esac
 
 # ============================================================================
-# STEP 9: sudo / wheel group
+# STEP 10: sudo / wheel group
 # ============================================================================
 header "Configuring sudo"
 usermod -aG wheel "$TARGET_USER"
@@ -474,9 +536,10 @@ if [ -f /etc/sudoers ]; then
         echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/wheel
         chmod 0440 /etc/sudoers.d/wheel
         if command -v visudo >/dev/null 2>&1 && ! visudo -cf /etc/sudoers.d/wheel >/dev/null 2>&1; then
+            FAILED_STEPS+=("visudo validation failed for /etc/sudoers.d/wheel")
             warn "visudo validation failed for wheel rule -- please check /etc/sudoers.d/wheel manually."
         else
-            ok "Enabled passwordless-capable sudo for group 'wheel' via /etc/sudoers.d/wheel"
+            ok "Enabled sudo for group 'wheel' via /etc/sudoers.d/wheel"
         fi
     else
         ok "wheel group already has sudo rights."
@@ -484,31 +547,64 @@ if [ -f /etc/sudoers ]; then
 fi
 
 # ============================================================================
-# STEP 10: File access niceties
+# STEP 11: File access niceties
 # ============================================================================
 header "Finishing touches"
-enable_service udisks2 2>/dev/null || true
+enable_service udisks2
 su - "$TARGET_USER" -c "xdg-user-dirs-update" 2>/dev/null || true
+
+# ============================================================================
+# STEP 12: Verification report
+# ============================================================================
+header "Verification report"
+printf "%-28s %s\n" "Component" "Status"
+printf "%-28s %s\n" "---------" "------"
+check_line() {
+    local label="$1" cond="$2"
+    if eval "$cond"; then
+        printf "%-28s ${C_GREEN}PASS${C_RESET}\n" "$label"
+    else
+        printf "%-28s ${C_RED}FAIL${C_RESET}\n" "$label"
+        FAILED_STEPS+=("$label")
+    fi
+}
+check_line "dbus service"          '[ -L /var/service/dbus ]'
+check_line "NetworkManager"        '[ -L /var/service/NetworkManager ] && command -v nmcli >/dev/null'
+check_line "PipeWire"              'command -v pipewire >/dev/null'
+check_line "CUPS"                  '[ -L /var/service/cupsd ] && command -v lpstat >/dev/null'
+check_line "wheel sudo rule"       'grep -Eq "wheel.*ALL=" /etc/sudoers /etc/sudoers.d/* 2>/dev/null'
+case "$DE_CHOICE" in
+    1|5) check_line "Login manager (SDDM)" '[ -L /var/service/sddm ]' ;;
+    2)   check_line "Login manager (GDM)"  '[ -L /var/service/gdm ]' ;;
+    3|4|12) check_line "Login manager (LightDM)" '[ -L /var/service/lightdm ]' ;;
+    6|7|8|9|10|11) check_line "Login manager (greetd)" '[ -L /var/service/greetd ]' ;;
+esac
 
 # ============================================================================
 # Done
 # ============================================================================
-header "Setup complete!"
-cat <<EOF
-User '$TARGET_USER' has been configured with:
-  - sudo (wheel group)
-  - audio (PipeWire), video, input, network, _seatd group membership
-  - NetworkManager for WiFi / wired networking
-  - GPU drivers for option $GPU_CHOICE
-  - Desktop/WM for option $DE_CHOICE
+header "Setup complete"
+echo "User:        $TARGET_USER"
+echo "Desktop/WM:  ${DE_NAMES[$DE_CHOICE]}"
+echo "GPU driver:  ${GPU_NAMES[$GPU_CHOICE]}"
+echo "Log file:    $LOG_FILE"
+echo
 
-Log file: $LOG_FILE
+if [ "${#FAILED_STEPS[@]}" -gt 0 ]; then
+    warn "The following items need attention before you reboot:"
+    for item in "${FAILED_STEPS[@]}"; do
+        printf "   - %s\n" "$item"
+    done
+    warn "Check $LOG_FILE for the exact xbps-install error output for each of these."
+else
+    ok "All checks passed."
+fi
 
->>> Please REBOOT now: sudo reboot <<<
-
-After reboot you should land on a graphical login screen. If a Wayland
-compositor (Hyprland/Niri/Sway/Labwc/Wayfire/River) doesn't show its shell
-bar automatically on first login, check the autostart line that was added
-to your compositor config in ~/.config and adjust it as needed -- config
-syntax/keybind files vary between versions.
-EOF
+echo
+echo ">>> Reboot now: sudo reboot <<<"
+echo
+echo "After reboot you should land on a graphical login screen. If a Wayland"
+echo "compositor (Hyprland/Niri/Sway/Labwc/Wayfire/River) doesn't show its shell"
+echo "bar automatically on first login, check the autostart line added to your"
+echo "compositor config under ~/.config -- exact config syntax can shift"
+echo "between versions of these still-young projects."
