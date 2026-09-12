@@ -287,9 +287,9 @@ sync_repos
 # STEP 4: Base graphical stack (dbus, seat management, portals, fonts)
 # ============================================================================
 header "Installing base system services"
-xi dbus elogind seatd polkit \
-   xdg-user-dirs xdg-user-dirs-gtk xdg-utils xdg-desktop-portal \
-   sudo git wget curl nano unzip zip htop \
+xi dbus elogind seatd polkit sudo
+xi_soft xdg-user-dirs xdg-user-dirs-gtk xdg-utils xdg-desktop-portal \
+   git wget curl nano unzip zip htop \
    dejavu-fonts-ttf liberation-fonts-ttf noto-fonts-emoji terminus-font \
    udisks2 gvfs
 
@@ -306,7 +306,8 @@ fi
 # STEP 5: Networking -- NetworkManager for WiFi + Ethernet
 # ============================================================================
 header "Setting up networking / WiFi (NetworkManager)"
-xi NetworkManager network-manager-applet linux-firmware-network wpa_supplicant
+xi NetworkManager
+xi_soft network-manager-applet linux-firmware-network wpa_supplicant
 
 # Void ships dhcpcd enabled by default on some install profiles; it will
 # fight with NetworkManager over the interface, so disable it if present.
@@ -321,7 +322,8 @@ ok "NetworkManager installed and enabled."
 # STEP 6: Audio -- PipeWire + WirePlumber + ALSA compatibility
 # ============================================================================
 header "Setting up audio (PipeWire)"
-xi pipewire alsa-pipewire libspa-bluetooth pavucontrol pamixer playerctl
+xi pipewire
+xi_soft alsa-pipewire libspa-bluetooth pavucontrol pamixer playerctl
 
 mkdir -p /etc/pipewire/pipewire.conf.d
 ln -sf /usr/share/examples/wireplumber/10-wireplumber.conf \
@@ -347,8 +349,8 @@ ok "Audio stack installed (PipeWire + ALSA compatibility layer)."
 # STEP 7: Printing -- CUPS + Avahi for network/driverless printers
 # ============================================================================
 header "Setting up printing (CUPS)"
-xi cups cups-filters avahi nss-mdns
-xi_soft system-config-printer
+xi cups
+xi_soft cups-filters avahi nss-mdns system-config-printer
 
 enable_service cupsd hard
 enable_service avahi-daemon
@@ -363,31 +365,43 @@ ok "CUPS installed and enabled. Manage printers at http://localhost:631 or via s
 # STEP 8: GPU drivers
 # ============================================================================
 header "Installing GPU drivers"
-# Note: Void does not ship a standalone "mesa-vdpau" package -- VDPAU support
-# is provided everywhere via the libvdpau-va-gl wrapper (per Void's own
-# AMD/Intel/NVIDIA driver docs), so that's installed per-branch below instead.
-xi vulkan-loader mesa-dri mesa-vaapi libvdpau-va-gl
+# Only the base OpenGL bits are hard-required -- without mesa-dri there's no
+# graphical output at all. Everything else here (Vulkan, VA-API, VDPAU,
+# vendor-specific DDX drivers) is a performance/feature add-on: Xorg and
+# Wayland compositors fall back to the generic "modesetting"/llvmpipe path
+# just fine without them, so those are all soft-installed. This also means
+# one wrong/renamed package name (as happened with mesa-vulkan-swrast and
+# xf86-video-vmware, neither of which actually exist in Void's repos) can
+# no longer take down the whole GPU step.
+xi vulkan-loader mesa-dri
+xi_soft mesa-vaapi libvdpau-va-gl
 
 case "$GPU_CHOICE" in
     1) info "Installing AMD drivers..."
-       xi linux-firmware-amd mesa-vulkan-radeon xf86-video-amdgpu
+       xi_soft linux-firmware-amd mesa-vulkan-radeon xf86-video-amdgpu
        ;;
     2) info "Installing Intel iGPU drivers..."
-       xi linux-firmware-intel mesa-vulkan-intel intel-video-accel
+       xi_soft linux-firmware-intel mesa-vulkan-intel intel-video-accel
        ;;
     3) info "Installing Intel dGPU (Arc) drivers..."
-       xi linux-firmware-intel mesa-vulkan-intel intel-video-accel
+       xi_soft linux-firmware-intel mesa-vulkan-intel intel-video-accel
        warn "Intel Arc dGPUs need a recent kernel. Run 'xbps-install -Su linux' if you hit issues."
        ;;
     4) info "Installing NVIDIA (Nouveau, open-source) drivers..."
-       xi xf86-video-nouveau mesa-vulkan-nouveau
+       xi_soft xf86-video-nouveau mesa-vulkan-nouveau
        ;;
     5) info "Installing NVIDIA proprietary drivers..."
-       xi nvidia nvidia-libs
+       xi nvidia
+       xi_soft nvidia-libs
        warn "A reboot is required for the proprietary NVIDIA driver to take effect."
        ;;
     6) info "Installing Mesa (generic/VM) drivers..."
-       xi mesa-vulkan-swrast xf86-video-qxl xf86-video-vmware xf86-video-fbdev
+       # mesa-vulkan-lavapipe is Void's actual name for the software Vulkan
+       # rasterizer (upstream renamed it from "swrast" to "lavapipe" years
+       # ago -- Void's package follows that naming). xf86-video-vmware is
+       # not packaged in Void at all; VMware/QEMU guests use the generic
+       # "modesetting" Xorg driver instead, which mesa-dri already covers.
+       xi_soft mesa-vulkan-lavapipe xf86-video-qxl xf86-video-fbdev
        xi_soft qemu-guest-agent spice-vdagent
        enable_service qemu-guest-agent
        enable_service spice-vdagentd
