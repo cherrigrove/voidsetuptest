@@ -239,33 +239,66 @@ GPU_NAMES=(
     ""
     "AMD"
     "Intel iGPU"
-    "Intel dGPU"
+    "Intel dGPU (Arc)"
     "NVIDIA Nouveau (open-source)"
-    "NVIDIA Proprietary"
-    "Mesa (for VMs)"
+    "NVIDIA (Turing and newer; nvidia package)"
+    "NVIDIA Proprietary (Maxwell to Volta)"
+    "NVIDIA Proprietary (Kepler)"
+    "NVIDIA Proprietary (Fermi)"
+    "Mesa (generic / VMs)"
 )
 
 header "GPU Driver Setup"
 cat <<'EOF'
-Choose your GPU Drivers:
+Choose your GPU drivers:
 
   1. AMD
   2. Intel iGPU
-  3. Intel dGPU
-  4. NVIDIA Nouveau
-  5. NVIDIA Proprietary
-  6. Mesa (for VMs)
+  3. Intel dGPU (Arc)
+  4. NVIDIA Nouveau (open-source)
+  5. NVIDIA Proprietary (Turing and newer) -> package: nvidia
+  6. NVIDIA Proprietary (Maxwell to Volta)  -> package: nvidia580
+  7. NVIDIA Proprietary (Kepler)            -> package: nvidia470
+  8. NVIDIA Proprietary (Fermi)             -> package: nvidia390
+  9. Mesa (generic / VMs)
+
+Void's current NVIDIA packages are generation-specific.
 
 EOF
-GPU_CHOICE=$(ask_choice 1 6)
+GPU_CHOICE=$(ask_choice 1 9)
+
+header "Nonfree repository"
+cat <<'EOF'
+Do you want to enable Void's nonfree repository?
+
+  1. Yes - enable nonfree packages
+  2. No  - keep only free official repositories
+
+Note: proprietary NVIDIA drivers require the nonfree repository.
+EOF
+NONFREE_CHOICE=$(ask_choice 1 2)
+
+# Proprietary NVIDIA drivers are maintained in Void's nonfree repository.
+# Force-enable it when any proprietary NVIDIA branch is selected.
+case "$GPU_CHOICE" in
+    5|6|7|8) NONFREE_CHOICE=1 ;;
+esac
 
 header "Summary"
 echo "  User:              $TARGET_USER"
 echo "  Desktop/WM:        ${DE_NAMES[$DE_CHOICE]}"
 echo "  GPU driver:        ${GPU_NAMES[$GPU_CHOICE]}"
+echo "  Nonfree repo:      $( [ "$NONFREE_CHOICE" -eq 1 ] && echo enabled || echo disabled )"
 read -rp "Proceed with installation? [Y/n] " CONFIRM
 CONFIRM=${CONFIRM:-Y}
 [[ "$CONFIRM" =~ ^[Yy] ]] || die "Aborted by user."
+
+if [ "$NONFREE_CHOICE" -eq 1 ]; then
+    xi void-repo-nonfree
+    sync_repos
+else
+    ok "Leaving the nonfree repository disabled."
+fi
 
 # ============================================================================
 # STEP 3: Full system sync/update FIRST.
@@ -280,16 +313,13 @@ xbps-install -Suy 2>&1 | tee -a "$LOG_FILE"
 xbps-install -Suy 2>&1 | tee -a "$LOG_FILE"
 ok "System is up to date."
 
-xi void-repo-nonfree
-sync_repos
-
 # ============================================================================
 # STEP 4: Base graphical stack (dbus, seat management, portals, fonts)
 # ============================================================================
 header "Installing base system services"
 xi dbus elogind seatd polkit sudo
 xi_soft xdg-user-dirs xdg-user-dirs-gtk xdg-utils xdg-desktop-portal \
-   git wget curl nano unzip zip htop \
+   git wget curl nano unzip zip htop pciutils \
    dejavu-fonts-ttf liberation-fonts-ttf noto-fonts-emoji terminus-font \
    udisks2 gvfs
 
@@ -297,6 +327,11 @@ enable_service dbus hard
 enable_service polkitd
 enable_service elogind
 enable_service seatd
+
+header "Setting up power profiles"
+xi power-profiles-daemon
+enable_service power-profiles-daemon hard
+verify_binary powerprofilesctl "power-profiles-daemon"
 
 if getent group _seatd >/dev/null 2>&1; then
     usermod -aG _seatd "$TARGET_USER"
@@ -378,31 +413,45 @@ xi_soft mesa-vaapi libvdpau-va-gl
 
 case "$GPU_CHOICE" in
     1) info "Installing AMD drivers..."
-       xi_soft linux-firmware-amd mesa-vulkan-radeon xf86-video-amdgpu
+       xi linux-firmware-amd
+       xi_soft mesa-vulkan-radeon amdvlk xf86-video-amdgpu
        ;;
     2) info "Installing Intel iGPU drivers..."
-       xi_soft linux-firmware-intel mesa-vulkan-intel intel-video-accel
+       xi linux-firmware-intel
+       xi_soft mesa-vulkan-intel intel-video-accel
        ;;
     3) info "Installing Intel dGPU (Arc) drivers..."
-       xi_soft linux-firmware-intel mesa-vulkan-intel intel-video-accel
-       warn "Intel Arc dGPUs need a recent kernel. Run 'xbps-install -Su linux' if you hit issues."
+       xi linux-firmware-intel
+       xi mesa-vulkan-intel
+       xi_soft intel-video-accel
+       warn "Intel Arc GPUs need a sufficiently recent kernel."
        ;;
     4) info "Installing NVIDIA (Nouveau, open-source) drivers..."
-       xi_soft xf86-video-nouveau mesa-vulkan-nouveau
+       xi xf86-video-nouveau mesa-vulkan-nouveau
        ;;
-    5) info "Installing NVIDIA proprietary drivers..."
+    5) info "Installing NVIDIA proprietary drivers (Turing and newer)..."
        xi nvidia
        xi_soft nvidia-libs
        warn "A reboot is required for the proprietary NVIDIA driver to take effect."
        ;;
-    6) info "Installing Mesa (generic/VM) drivers..."
-       # mesa-vulkan-lavapipe is Void's actual name for the software Vulkan
-       # rasterizer (upstream renamed it from "swrast" to "lavapipe" years
-       # ago -- Void's package follows that naming). xf86-video-vmware is
-       # not packaged in Void at all; VMware/QEMU guests use the generic
-       # "modesetting" Xorg driver instead, which mesa-dri already covers.
-       xi_soft mesa-vulkan-lavapipe xf86-video-qxl xf86-video-fbdev
-       xi_soft qemu-guest-agent spice-vdagent
+    6) info "Installing NVIDIA proprietary drivers (Maxwell to Volta)..."
+       xi nvidia580
+       xi_soft nvidia580-libs
+       warn "A reboot is required for the proprietary NVIDIA driver to take effect."
+       ;;
+    7) info "Installing NVIDIA proprietary drivers (Kepler)..."
+       xi nvidia470
+       xi_soft nvidia470-libs
+       warn "A reboot is required for the proprietary NVIDIA driver to take effect."
+       ;;
+    8) info "Installing NVIDIA proprietary drivers (Fermi)..."
+       xi nvidia390
+       xi_soft nvidia390-libs
+       warn "A reboot is required for the proprietary NVIDIA driver to take effect."
+       ;;
+    9) info "Installing Mesa (generic / VM) drivers..."
+       xi mesa-vulkan-lavapipe
+       xi_soft xf86-video-qxl xf86-video-fbdev qemu-guest-agent spice-vdagent
        enable_service qemu-guest-agent
        enable_service spice-vdagentd
        SYS_VENDOR=""
@@ -495,23 +544,55 @@ autostart_shell_cmd() {
 }
 
 # Full "xorg" meta-package (not xorg-minimal) so DDX drivers/fonts/input
-# drivers are all guaranteed present -- this is a common cause of a blank
-# screen or missing DM on Xorg desktops. Only "xorg" itself is treated as
-# hard-required; xterm/setxkbmap/numlockx are just conveniences.
+# drivers are all guaranteed present. xterm is deliberately NOT installed
+# normally; it is only used as a fallback when the selected DE/WM has no
+# usable terminal.
 XORG_PKGS=(xorg)
-XORG_EXTRAS=(xterm setxkbmap numlockx)
+XORG_EXTRAS=(setxkbmap numlockx)
 WAYLAND_CORE=(wayland xorg-server-xwayland)
+
+ensure_terminal() {
+    local preferred="$1"
+    if command -v "$preferred" >/dev/null 2>&1; then
+        ok "Terminal available: $preferred"
+        return 0
+    fi
+    info "Installing preferred terminal: $preferred"
+    if xi "$preferred"; then
+        return 0
+    fi
+    warn "Preferred terminal '$preferred' is unavailable; installing xterm as fallback."
+    xi xterm
+}
+
+ensure_any_terminal() {
+    local bin
+    # Do not add xterm when the user already has any usable terminal.
+    for bin in konsole gnome-console gnome-terminal ptyxis xfce4-terminal mate-terminal qterminal foot kitty alacritty wezterm terminator xterm; do
+        if command -v "$bin" >/dev/null 2>&1; then
+            ok "Existing terminal detected: $bin"
+            return 0
+        fi
+    done
+    info "No terminal emulator found; installing xterm as the fallback terminal."
+    xi xterm
+}
 
 case "$DE_CHOICE" in
     1) xi "${XORG_PKGS[@]}"; xi_soft "${XORG_EXTRAS[@]}"
        xi kde-plasma
-       xi_soft kde-baseapps
+       # Void has no separate "breeze-sounds" package. Plasma's current sound
+       # theme is ocean-sound-theme, with oxygen-sounds available as fallback.
+       xi ocean-sound-theme
+       xi_soft breeze oxygen-sounds
+       ensure_terminal konsole
        enable_service sddm hard
        verify_binary sddm "SDDM"
        ok "KDE Plasma installed. Login manager: SDDM."
        ;;
     2) xi "${XORG_PKGS[@]}"; xi_soft "${XORG_EXTRAS[@]}"
        xi gnome gdm
+       ensure_terminal gnome-console
        xi_soft gnome-browser-connector xdg-desktop-portal-gnome
        enable_service gdm hard
        verify_binary gdm "GDM"
@@ -519,6 +600,7 @@ case "$DE_CHOICE" in
        ;;
     3) xi "${XORG_PKGS[@]}"; xi_soft "${XORG_EXTRAS[@]}"
        xi xfce4 lightdm lightdm-gtk3-greeter
+       ensure_terminal xfce4-terminal
        xi_soft xfce4-goodies network-manager-applet
        enable_service lightdm hard
        verify_binary lightdm "LightDM"
@@ -526,6 +608,7 @@ case "$DE_CHOICE" in
        ;;
     4) xi "${XORG_PKGS[@]}"; xi_soft "${XORG_EXTRAS[@]}"
        xi mate lightdm lightdm-gtk3-greeter
+       ensure_terminal mate-terminal
        xi_soft mate-extra network-manager-applet
        enable_service lightdm hard
        verify_binary lightdm "LightDM"
@@ -533,6 +616,7 @@ case "$DE_CHOICE" in
        ;;
     5) xi "${XORG_PKGS[@]}"; xi_soft "${XORG_EXTRAS[@]}"
        xi lxqt sddm
+       ensure_terminal qterminal
        xi_soft network-manager-applet
        enable_service sddm hard
        verify_binary sddm "SDDM"
@@ -544,6 +628,7 @@ case "$DE_CHOICE" in
           hypridle hyprlock hyprpaper qt5-wayland qt6-wayland pcmanfm gvfs-mtp
        install_dank_material_shell
        install_greetd "Hyprland"
+       ensure_any_terminal
        autostart_shell_cmd ".config/hypr" "hyprland.conf" "exec-once = dms run"
        ok "Hyprland + Dank Material Shell installed. Login manager: greetd."
        ;;
@@ -551,6 +636,7 @@ case "$DE_CHOICE" in
        xi_soft xdg-desktop-portal-gtk pcmanfm gvfs-mtp
        install_dank_material_shell
        install_greetd "niri"
+       ensure_any_terminal
        autostart_shell_cmd ".config/niri" "config.kdl" "spawn-at-startup \"dms\" \"run\""
        ok "Niri + Dank Material Shell installed. Login manager: greetd."
        ;;
@@ -558,6 +644,7 @@ case "$DE_CHOICE" in
        xi_soft swaylock swayidle swaybg xdg-desktop-portal-wlr pcmanfm gvfs-mtp
        install_dank_material_shell
        install_greetd "sway"
+       ensure_any_terminal
        autostart_shell_cmd ".config/sway" "config" "exec dms run"
        ok "Sway + Dank Material Shell installed. Login manager: greetd."
        ;;
@@ -565,6 +652,7 @@ case "$DE_CHOICE" in
        xi_soft swaybg xdg-desktop-portal-wlr pcmanfm gvfs-mtp
        install_dank_material_shell
        install_greetd "labwc"
+       ensure_any_terminal
        autostart_shell_cmd ".config/labwc" "autostart" "dms run &"
        ok "Labwc + Dank Material Shell installed. Login manager: greetd."
        ;;
@@ -652,8 +740,20 @@ check_line() {
 check_line "dbus service"          '[ -L /var/service/dbus ]'
 check_line "NetworkManager"        '[ -L /var/service/NetworkManager ] && command -v nmcli >/dev/null'
 check_line "PipeWire"              'command -v pipewire >/dev/null'
+check_line "Power profiles"         '[ -L /var/service/power-profiles-daemon ] && command -v powerprofilesctl >/dev/null'
 check_line "CUPS"                  '[ -L /var/service/cupsd ] && command -v lpstat >/dev/null'
 check_line "wheel sudo rule"       'grep -Eq "wheel.*ALL=" /etc/sudoers /etc/sudoers.d/* 2>/dev/null'
+case "$GPU_CHOICE" in
+    1) check_line "AMD firmware" 'xbps-query -l linux-firmware-amd >/dev/null 2>&1' ;;
+    2|3) check_line "Intel GPU stack" 'xbps-query -l linux-firmware-intel >/dev/null 2>&1 && xbps-query -l mesa-vulkan-intel >/dev/null 2>&1' ;;
+    4) check_line "Nouveau driver" 'xbps-query -l xf86-video-nouveau >/dev/null 2>&1 && xbps-query -l mesa-vulkan-nouveau >/dev/null 2>&1' ;;
+    5) check_line "NVIDIA driver" 'xbps-query -l nvidia >/dev/null 2>&1' ;;
+    6) check_line "NVIDIA 580 driver" 'xbps-query -l nvidia580 >/dev/null 2>&1' ;;
+    7) check_line "NVIDIA 470 driver" 'xbps-query -l nvidia470 >/dev/null 2>&1' ;;
+    8) check_line "NVIDIA 390 driver" 'xbps-query -l nvidia390 >/dev/null 2>&1' ;;
+    9) check_line "Mesa software Vulkan" 'xbps-query -l mesa-vulkan-lavapipe >/dev/null 2>&1' ;;
+esac
+
 case "$DE_CHOICE" in
     1|5) check_line "Login manager (SDDM)" '[ -L /var/service/sddm ]' ;;
     2)   check_line "Login manager (GDM)"  '[ -L /var/service/gdm ]' ;;
